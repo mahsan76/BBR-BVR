@@ -1,0 +1,240 @@
+/*
+ * BBR-FC Two-Phase Pacing Shift Patch
+ * =====================================
+ * Target file : tcp_bbr-fc.c  (your out-of-tree BBR-FC module)
+ * Based on    : tcp_bbr3.c (Google BBRv3, as uploaded)
+ * Purpose     : Increase tcp_1up throughput on WiFi-6 by using a larger
+ *               pacing burst during STARTUP (shift=9) and restoring the
+ *               standard burst size in steady-state (shift=10).
+ *
+ * HOW TO APPLY
+ * ------------
+ * This is NOT a unified diff — it is a clearly annotated set of changes
+ * to make at exact locations in tcp_bbr-fc.c.  Three places are changed:
+ *
+ *   CHANGE 1 — Add two #define constants near the top of the file,
+ *              after the existing BBR_UNIT / BW_UNIT definitions.
+ *
+ *   CHANGE 2 — Add one helper function bbr_fc_update_pacing_shift(),
+ *              placed immediately BEFORE bbr_update_gains().
+ *
+ *   CHANGE 3 — Call the helper from bbr_init() (once at connection start)
+ *              AND from bbr_main() (once per round, after bbr_update_gains).
+ *
+ * =========================================================================
+ */
+
+
+/* =========================================================================
+ * CHANGE 1 — Constants
+ * Location  : top of tcp_bbr-fc.c, after the existing lines:
+ *               #define BBR_SCALE 8
+ *               #define BBR_UNIT  (1 << BBR_SCALE)
+ *
+ * Paste the following block immediately after those two lines.
+ * =========================================================================
+ */
+
+/* Pacing shift for STARTUP phase:
+ *   shift=9  → burst = pacing_rate / 512
+ *   At 400 Mbps this gives ~98 KB bursts, filling the WiFi-6 A-MPDU
+ *   aggregation window (up to 64 × 1500 = 96 KB) in a single TXOP.
+ *   Larger bursts during STARTUP means fewer TXOP slots are wasted while
+ *   the pacing rate is still ramping toward the bottleneck bandwidth.
+ */
+#define BBR_FC_PACING_SHIFT_STARTUP   9
+
+/* Pacing shift for all steady-state phases (DRAIN, PROBE_BW, PROBE_RTT):
+ *   shift=10 → burst = pacing_rate / 1024  (TCP/BBRv3 default)
+ *   At 400–500 Mbps this gives ~49–61 KB, matching the typical WiFi-6
+ *   TXOP data budget (600 Mbps × 5.484 ms / 8 ≈ 41 KB) with some slack.
+ *   Algorithm 1 MIN_SEGS=4 floor still applies as the hard lower bound.
+ */
+#define BBR_FC_PACING_SHIFT_STEADY   10
+
+
+/* =========================================================================
+ * CHANGE 2 — Helper function bbr_fc_update_pacing_shift()
+ * Location  : paste this function immediately BEFORE bbr_update_gains()
+ *             in tcp_bbr-fc.c.
+ *
+ * bbr_update_gains() starts at approximately line 942 in the upstream
+ * tcp_bbr3.c file.  In your tcp_bbr-fc.c it will be at a similar location.
+ * Look for:
+ *
+ *     static void bbr_update_gains(struct sock *sk)
+ *     {
+ *         struct bbr *bbr = inet_csk_ca(sk);
+ *         switch (bbr->mode) {
+ *
+ * Paste the entire block below ABOVE that function.
+ * =========================================================================
+ */
+
+/*
+ * bbr_fc_update_pacing_shift - Two-phase pacing burst control for WiFi-6.
+ *
+ * Called once per round trip (when bbr->round_start == 1) from bbr_main(),
+ * and once at connection init from bbr_fc_init().
+ *
+ * STARTUP (mode == BBR_STARTUP):
+ *   Use shift=9 so each pacing burst is ~2× larger than the BBRv3 default.
+ *   This keeps the WiFi-6 A-MPDU aggregation engine busy during the initial
+ *   slow-start ramp, reducing wasted TXOP slots and accelerating the
+ *   bandwidth estimate convergence.
+ *
+ * All other modes (DRAIN, PROBE_BW, PROBE_RTT):
+ *   Restore shift=10 (TCP default / BBRv3 default).  In steady state the
+ *   pipe is already full; oversized bursts would only inflate the A-MPDU
+ *   queue and increase RTT.  Algorithm 1's MIN_SEGS=4 floor continues to
+ *   prevent under-shooting on short RTT paths.
+ *
+ * Note: sk_pacing_shift is a field of struct sock, not struct bbr.
+ *       Writing to it here is safe and requires no kernel modification —
+ *       it is simply a per-socket integer that any congestion control
+ *       module is permitted to modify.
+ */
+static void bbr_fc_update_pacing_shift(struct sock *sk)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+
+	if (bbr->mode == BBR_STARTUP) {
+		/*
+		 * Aggressive burst size during pipe-filling.
+		 * Only update if not already at the startup value, to avoid
+		 * a needless cache-line write on every ACK in STARTUP.
+		 */
+		if (sk->sk_pacing_shift != BBR_FC_PACING_SHIFT_STARTUP)
+			sk->sk_pacing_shift = BBR_FC_PACING_SHIFT_STARTUP;
+	} else {
+		/*
+		 * Steady-state: DRAIN, PROBE_BW (all sub-phases), PROBE_RTT.
+		 * Restore conservative burst granularity.
+		 */
+		if (sk->sk_pacing_shift != BBR_FC_PACING_SHIFT_STEADY)
+			sk->sk_pacing_shift = BBR_FC_PACING_SHIFT_STEADY;
+	}
+}
+
+
+/* =========================================================================
+ * CHANGE 3a — Call from bbr_fc_init()
+ * Location   : inside bbr_fc_init() (your renamed version of bbr_init()),
+ *              immediately after the cmpxchg() line:
+ *
+ *     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+ *
+ * Add the single line shown below right after cmpxchg().
+ *
+ * BEFORE (existing code):
+ * -------------------------
+ *     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+ *
+ *     // Start sampling ECN mark rate after first full flight is ACKed:
+ *     bbr->loss_round_delivered = tp->delivered + 1;
+ *
+ * AFTER (with the new line added):
+ * -------------------------
+ *     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+ *
+ *     // WiFi-6 two-phase pacing shift: start with STARTUP burst size.
+ *     bbr_fc_update_pacing_shift(sk);   // <-- ADD THIS LINE
+ *
+ *     // Start sampling ECN mark rate after first full flight is ACKed:
+ *     bbr->loss_round_delivered = tp->delivered + 1;
+ * =========================================================================
+ */
+
+/* Snippet showing the modified bbr_fc_init() section — copy as-is: */
+
+	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+
+	/* WiFi-6 two-phase pacing shift: STARTUP uses shift=9 for larger
+	 * bursts that fill A-MPDU aggregation windows faster; steady-state
+	 * uses shift=10 to avoid queue bloat once the pipe is full.
+	 */
+	bbr_fc_update_pacing_shift(sk);   /* <<< NEW LINE — CHANGE 3a */
+
+	/* Start sampling ECN mark rate after first full flight is ACKed: */
+	bbr->loss_round_delivered = tp->delivered + 1;
+
+
+/* =========================================================================
+ * CHANGE 3b — Call from bbr_main() / bbr_fc_main()
+ * Location   : inside bbr_main() (rename to bbr_fc_main() in your module),
+ *              immediately after the call to bbr_update_gains(sk).
+ *
+ * The relevant section in upstream bbr_main() looks like this (lines ~2063):
+ *
+ *     bbr_update_gains(sk);
+ *     bw = bbr_bw(sk);
+ *     bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
+ *
+ * BEFORE (existing code):
+ * -------------------------
+ *     bbr_update_gains(sk);
+ *     bw = bbr_bw(sk);
+ *     bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
+ *
+ * AFTER (with the new line added):
+ * -------------------------
+ *     bbr_update_gains(sk);
+ *     bbr_fc_update_pacing_shift(sk);   // <-- ADD THIS LINE
+ *     bw = bbr_bw(sk);
+ *     bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
+ *
+ * WHY HERE: bbr_update_gains() has just resolved bbr->mode for this ACK,
+ * including any STARTUP → DRAIN or DRAIN → PROBE_BW transition that
+ * bbr_check_drain() may have triggered inside bbr_update_model().
+ * Calling bbr_fc_update_pacing_shift() immediately after means the shift
+ * always reflects the mode that will be used in THIS call's pacing rate
+ * computation — there is never a one-round lag.
+ * =========================================================================
+ */
+
+/* Snippet showing the modified bbr_fc_main() section — copy as-is: */
+
+	bbr_update_gains(sk);
+	bbr_fc_update_pacing_shift(sk);   /* <<< NEW LINE — CHANGE 3b */
+	bw = bbr_bw(sk);
+	bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
+	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain,
+		     tcp_snd_cwnd(tp), &ctx);
+	bbr_bound_cwnd_for_inflight_model(sk);
+
+
+/* =========================================================================
+ * SUMMARY OF ALL CHANGES
+ * =========================================================================
+ *
+ *  #  | File location              | What to add/change
+ * ----|----------------------------|---------------------------------------
+ *  1  | After BBR_UNIT define      | Two #define constants (shift 9 and 10)
+ *  2  | Before bbr_update_gains()  | New function bbr_fc_update_pacing_shift()
+ *  3a | Inside bbr_fc_init()       | One call after cmpxchg()
+ *  3b | Inside bbr_fc_main()       | One call after bbr_update_gains()
+ *
+ * NO other files need to change.
+ * NO kernel recompile needed — only your out-of-tree module recompile:
+ *
+ *   make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+ *   sudo rmmod tcp_bbr_fc
+ *   sudo insmod tcp_bbr_fc.ko
+ *   sudo sysctl net.ipv4.tcp_congestion_control=bbr_fc
+ *
+ * =========================================================================
+ * EXPECTED FLENT tcp_1up BEHAVIOUR
+ * =========================================================================
+ *
+ *  Phase       | shift | burst@400Mbps | Effect
+ * -------------|-------|---------------|--------------------------------
+ *  STARTUP     |   9   |   ~98 KB      | Fills A-MPDU window; faster ramp
+ *  DRAIN       |  10   |   ~49 KB      | Controlled queue drain
+ *  PROBE_BW    |  10   |   ~49 KB      | TXOP-aligned; no aggregation stall
+ *  PROBE_RTT   |  10   |   ~49 KB      | cwnd=4pkts anyway; shift irrelevant
+ *
+ *  Combined with BBR-FC startup_pacing_gain=2.885 and ProbeBW UP=1.25,
+ *  the STARTUP phase exits faster and with a better BDP estimate,
+ *  giving higher steady-state throughput versus stock BBRv3 on WiFi-6.
+ * =========================================================================
+ */
